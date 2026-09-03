@@ -80,7 +80,28 @@ if (loc.get_vector_from_origin_NED_m(pos_ned_m)) {   // false until EKF origin i
 (the stock EKF sets this on first good GPS fix) — the shadow estimator can
 just piggyback on that rather than establishing its own origin.
 
-**4. Log it.** Add a new dataflash log message (see any existing
+**4. Feed it magnetometer readings** — this is what corrects yaw (see
+`docs/architecture.md`'s note on why GPS alone leaves it weak):
+
+```cpp
+// libraries/AP_Compass/AP_Compass.h
+const Vector3f &field = compass.get_field();  // body frame; direction is
+                                                // what matters, see below
+
+ins::MagSample mag;
+mag.timestamp_s = AP_HAL::micros64() * 1.0e-6;
+mag.field_body  = ins::Vector3(field.x, field.y, field.z);
+my_ekf.fuseMag(mag);
+```
+
+Set `my_ekf`'s `InsEkfConfig::mag_declination_rad` to match ArduPilot's own
+`COMPASS_DEC` parameter (same declination value, just fed to your instance
+too — `InsEkf` doesn't read ArduPilot's parameter system for you). Only the
+field's *direction* is used, so `AP_Compass`'s own hard/soft-iron
+calibration is what you're relying on for correctness here, same as it is
+for EKF3.
+
+**5. Log it.** Add a new dataflash log message (see any existing
 `AP::logger().WriteStreaming(...)` call in `AP_NavEKF3` for the pattern)
 recording `my_ekf.state()`'s position/velocity/attitude/biases alongside
 the stock EKF3's output. Compare them across real flights — this is the
@@ -101,17 +122,24 @@ contribution guidelines.
 
 ## What this library does *not* yet give you
 
-- **No magnetometer fusion** — see `docs/architecture.md`'s note on yaw
-  observability. ArduPilot's compass driver output
-  (`AP_Compass::get_field()`) would feed a new scalar-update measurement,
-  same pattern as the GPS updates in `InsEkf::fuseGps()`.
+- **No GPS innovation gating — a real spoofing/jamming exposure.**
+  `fuseScalar()` accepts every measurement it's given, weighted only by the
+  configured noise; there is no check on whether an innovation is
+  plausible. Jamming (GPS just stops) degrades gracefully — the filter
+  coasts on IMU (and now magnetometer-aided attitude), exactly like the
+  simulated dropout in `examples/FlightScenario.h`. **Spoofing does not**:
+  a fake-but-smoothly-varying GPS fix is indistinguishable, in this code,
+  from a real one, and the filter will track it. `AP_NavEKF3` mitigates
+  this with innovation/consistency gating (`EKx_POS_I_GATE`,
+  `EKx_VEL_I_GATE`) — this filter has no equivalent yet. Don't treat this
+  filter's position estimate as spoofing-resistant until that's added.
 - **No barometer fusion** for the vertical channel.
-- **No sensor health/failure handling** (stuck sensors, GPS glitch
-  rejection, innovation gating) — `AP_NavEKF3` has extensive logic here
-  that a flight-worthy backend would need equivalents of.
+- **No other sensor health/failure handling** (stuck sensors, glitch
+  rejection beyond the gating gap above) — `AP_NavEKF3` has extensive logic
+  here that a flight-worthy backend would need equivalents of.
 - **No airspeed/rangefinder/optical-flow fusion** — EKF3 supports these;
-  this filter only fuses IMU + GPS by design (see the project's original
-  scope).
+  this filter only fuses IMU + GPS + magnetometer by design (see the
+  project's original scope).
 
 None of these are architectural blockers — each is another scalar-update
 measurement source or a guard condition on top of the same 15-state filter

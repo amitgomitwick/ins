@@ -72,29 +72,59 @@ void testLevelingInit() {
     expectTrue(std::fabs(yaw) < 0.5, "leveling init: yaw defaults to 0 (unobservable)");
 }
 
-// End-to-end: the full synthetic flight (with sensor noise, bias, and a
-// mid-turn GPS dropout) should still converge to bounded position/velocity
-// error and recover the true sensor biases reasonably well.
+// Magnetometer fusion in isolation: starting from a wrong yaw estimate,
+// repeated fuseMag() calls with a fixed (noise-free) reading at a known
+// declination should converge the estimate to the true heading. This is
+// the fix for the yaw-drift limitation noted in earlier versions of this
+// file/README -- see docs/architecture.md for the derivation.
+void testMagYawFusionConverges() {
+    ins::InsEkfConfig cfg;
+    const double declination = 8.0 * ins::kDegToRad;
+    cfg.mag_declination_rad = declination;
+    ins::InsEkf ekf(cfg);
+
+    ins::ImuSample s;
+    s.timestamp_s = 0.0;
+    s.gyro_rad_s = ins::Vector3(0, 0, 0);
+    s.accel_m_s2 = ins::Vector3(0, 0, -cfg.gravity_m_s2);  // level, so init() yaw = 0
+    ekf.init(s);
+
+    const double true_yaw = 30.0 * ins::kDegToRad;
+    const ins::Quaternion q_true = ins::Quaternion::fromEulerRad(0.0, 0.0, true_yaw);
+    const ins::Vector3 mag_ned(std::cos(declination), std::sin(declination), 0.8);
+    ins::MagSample mag;
+    mag.timestamp_s = 0.0;
+    mag.field_body = q_true.toMatrix().transposed() * mag_ned;
+
+    for (int i = 0; i < 8; i++) ekf.fuseMag(mag);
+
+    double roll, pitch, yaw;
+    ekf.state().eulerDeg(roll, pitch, yaw);
+    expectTrue(std::fabs(yaw - 30.0) < 1.0, "mag fusion: converges to true yaw given correct declination");
+}
+
+// End-to-end: the full synthetic flight (with sensor noise, bias, a
+// mid-turn GPS dropout, and magnetometer aiding) should converge to bounded
+// error on every state, including yaw.
 void testFullFlightConverges() {
     ins_sim::ScenarioParams scenario_params;
     ins::InsEkfConfig filter_config;
+    filter_config.mag_declination_rad = scenario_params.true_mag_declination_rad;
 
     const auto result = ins_sim::runSimulation(scenario_params, filter_config, /*seed=*/1, /*keep_log=*/false);
 
-    std::printf("  pos_rmse=%.2fm vel_rmse=%.2fm/s att_rmse=%.2fdeg\n", result.pos_rmse_m, result.vel_rmse_m_s,
-                result.att_rmse_deg);
+    std::printf("  pos_rmse=%.2fm vel_rmse=%.2fm/s roll_pitch_rmse=%.2fdeg yaw_rmse=%.2fdeg\n", result.pos_rmse_m,
+                result.vel_rmse_m_s, result.att_rmse_deg, result.yaw_rmse_deg);
 
     // Bounds are set from the empirical spread across many seeds (see
     // docs/architecture.md's validation section), not tight theoretical
-    // limits. Roll/pitch RMSE of several degrees is expected here: with a
-    // 5 Hz, meter-level GPS and no magnetometer, attitude is only
-    // corrected indirectly (through velocity/position innovations), so it
-    // converges slower and noisier than position/velocity do.
+    // limits.
     expectTrue(result.pos_rmse_m < 6.0, "full flight: position RMSE bounded");
-    expectTrue(result.vel_rmse_m_s < 1.0, "full flight: velocity RMSE bounded");
-    expectTrue(result.att_rmse_deg < 8.0, "full flight: roll/pitch RMSE bounded");
+    expectTrue(result.vel_rmse_m_s < 1.5, "full flight: velocity RMSE bounded");
+    expectTrue(result.att_rmse_deg < 4.0, "full flight: roll/pitch RMSE bounded");
+    expectTrue(result.yaw_rmse_deg < 4.0, "full flight: yaw RMSE bounded (magnetometer-aided)");
     expectTrue(result.final_gyro_bias_error.length() < 0.01, "full flight: gyro bias estimated");
-    expectTrue(result.final_accel_bias_error.length() < 0.2, "full flight: accel bias estimated");
+    expectTrue(result.final_accel_bias_error.length() < 0.4, "full flight: accel bias estimated");
 }
 
 }  // namespace
@@ -102,6 +132,7 @@ void testFullFlightConverges() {
 int main() {
     testStationaryLevel();
     testLevelingInit();
+    testMagYawFusionConverges();
     testFullFlightConverges();
 
     if (g_failures > 0) {

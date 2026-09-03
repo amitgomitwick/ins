@@ -30,6 +30,7 @@
 
 #include "ins/GpsSample.h"
 #include "ins/ImuSample.h"
+#include "ins/MagSample.h"
 #include "ins/Math3.h"
 
 namespace ins {
@@ -59,6 +60,15 @@ struct InsEkfConfig {
     // GPS measurement noise (1-sigma).
     double gps_pos_noise_m = 1.5;
     double gps_vel_noise_m_s = 0.2;
+
+    // Magnetometer heading measurement noise (1-sigma, radians) and local
+    // magnetic declination (radians, positive = magnetic north is east of
+    // true north) -- set this to your location's actual declination
+    // (e.g. from the NOAA/WMM calculator ArduPilot itself uses) or yaw
+    // will be a magnetic-north estimate offset from true north by however
+    // wrong this value is. Defaults to 0 (i.e. "assume no declination").
+    double mag_yaw_noise_rad = 5.0 * kDegToRad;
+    double mag_declination_rad = 0.0;
 
     // Initial covariance (1-sigma) used by init().
     double init_pos_std_m = 5.0;
@@ -107,6 +117,14 @@ public:
     // whenever a new fix arrives; safe to call with only one of
     // position_valid/velocity_valid set.
     void fuseGps(const GpsSample& gps);
+
+    // Magnetometer heading update: tilt-compensates the raw reading using
+    // the filter's current roll/pitch estimate, derives a heading, and
+    // fuses it as a single scalar update on the yaw error state -- the
+    // direct observation GPS alone can't provide (see docs/architecture.md).
+    // Call at the magnetometer's own sample rate (it's typically slower
+    // than the IMU).
+    void fuseMag(const MagSample& mag);
 
     InsState state() const;
 

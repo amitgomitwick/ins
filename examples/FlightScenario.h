@@ -32,10 +32,16 @@ struct ScenarioParams {
     double gps_rate_hz = 5.0;
     double gps_dropout_start_s = 40.0;  // simulated GPS outage mid-turn,
     double gps_dropout_end_s = 50.0;    // to show the INS coasting on IMU alone.
+    double mag_rate_hz = 25.0;          // magnetometer keeps running through the GPS dropout
 
     // "True" sensor imperfections the filter must estimate/reject.
     Vector3 true_gyro_bias{0.020, -0.015, 0.010};      // rad/s
     Vector3 true_accel_bias{0.15, -0.10, 0.08};        // m/s^2
+
+    // A realistic nonzero declination, so the sim genuinely exercises the
+    // declination-compensation term in InsEkf::fuseMag rather than trivially
+    // passing with it at zero.
+    double true_mag_declination_rad = 8.0 * ins::kDegToRad;
 
     double totalDuration() const { return accel_phase_s + turn_phase_s + decel_phase_s; }
 };
@@ -211,7 +217,8 @@ struct LogRow {
 struct SimulationResult {
     double pos_rmse_m = 0.0;
     double vel_rmse_m_s = 0.0;
-    double att_rmse_deg = 0.0;
+    double att_rmse_deg = 0.0;   // roll/pitch only
+    double yaw_rmse_deg = 0.0;
     Vector3 final_gyro_bias_error;
     Vector3 final_accel_bias_error;
     std::vector<LogRow> log;
@@ -232,8 +239,10 @@ inline SimulationResult runSimulation(const ScenarioParams& scenario_params,
     ins::InsEkf ekf(filter_config);
     SimulationResult result;
 
+    const double mag_dt = 1.0 / scenario_params.mag_rate_hz;
     double next_gps_t = gps_dt;
-    double sum_pos_sq = 0.0, sum_vel_sq = 0.0, sum_att_sq = 0.0;
+    double next_mag_t = mag_dt;
+    double sum_pos_sq = 0.0, sum_vel_sq = 0.0, sum_att_sq = 0.0, sum_yaw_sq = 0.0;
     int n_samples = 0;
     const double total_t = scenario.totalDuration();
     const int n_steps = static_cast<int>(total_t / imu_dt);
@@ -270,6 +279,23 @@ inline SimulationResult runSimulation(const ScenarioParams& scenario_params,
                     gps_fused = true;
                 }
             }
+
+            if (t >= next_mag_t) {
+                next_mag_t += mag_dt;
+                // Perturb the *assumed magnetic north direction* by the
+                // configured noise (rather than the raw body-frame vector)
+                // so the injected noise matches the filter's assumed R,
+                // same "well-tuned filter" pattern used for GPS above.
+                // Runs through the GPS dropout too -- magnetometer heading
+                // doesn't depend on GPS being available.
+                const double heading_noise = nrm(rng) * filter_config.mag_yaw_noise_rad;
+                const double decl = scenario_params.true_mag_declination_rad + heading_noise;
+                const Vector3 mag_ned(0.6 * std::cos(decl), 0.6 * std::sin(decl), 0.8);
+                ins::MagSample mag;
+                mag.timestamp_s = t;
+                mag.field_body = truth.attitude.toMatrix().transposed() * mag_ned;
+                ekf.fuseMag(mag);
+            }
         }
 
         const ins::InsState est = ekf.state();
@@ -280,11 +306,16 @@ inline SimulationResult runSimulation(const ScenarioParams& scenario_params,
         est.attitude.toEulerRad(er, ep, ey);
         const double att_err_deg =
             std::sqrt((tr - er) * (tr - er) + (tp - ep) * (tp - ep)) * ins::kRadToDeg;
+        double yaw_err = ty - ey;
+        while (yaw_err > M_PI) yaw_err -= 2.0 * M_PI;
+        while (yaw_err < -M_PI) yaw_err += 2.0 * M_PI;
+        const double yaw_err_deg = yaw_err * ins::kRadToDeg;
 
         if (t > 5.0) {  // skip initial convergence transient for RMSE stats
             sum_pos_sq += pos_err * pos_err;
             sum_vel_sq += vel_err * vel_err;
             sum_att_sq += att_err_deg * att_err_deg;
+            sum_yaw_sq += yaw_err_deg * yaw_err_deg;
             n_samples++;
         }
 
@@ -316,6 +347,7 @@ inline SimulationResult runSimulation(const ScenarioParams& scenario_params,
     result.pos_rmse_m = std::sqrt(sum_pos_sq / std::max(1, n_samples));
     result.vel_rmse_m_s = std::sqrt(sum_vel_sq / std::max(1, n_samples));
     result.att_rmse_deg = std::sqrt(sum_att_sq / std::max(1, n_samples));
+    result.yaw_rmse_deg = std::sqrt(sum_yaw_sq / std::max(1, n_samples));
     return result;
 }
 

@@ -199,6 +199,30 @@ void InsEkf::fuseGps(const GpsSample& gps) {
     injectErrorState();
 }
 
+void InsEkf::fuseMag(const MagSample& mag) {
+    if (!initialized_) return;
+
+    // Tilt-compensate: express the reading in the "yaw=0" intermediate
+    // frame (body rotated by the filter's current roll/pitch only). Since
+    // R_nb = Rz(yaw) * R_roll_pitch, this equals Rz(-yaw) applied to the
+    // true NED field -- i.e. its horizontal angle is (declination - yaw).
+    // See docs/architecture.md for the full derivation.
+    double roll, pitch, current_yaw;
+    q_.toEulerRad(roll, pitch, current_yaw);
+    const Quaternion q_level = Quaternion::fromEulerRad(roll, pitch, 0.0);
+    const Vector3 field_level = q_level.toMatrix() * mag.field_body;
+
+    const double yaw_meas = config_.mag_declination_rad - std::atan2(field_level.y, field_level.x);
+
+    double innovation = yaw_meas - current_yaw;
+    while (innovation > M_PI) innovation -= 2.0 * M_PI;
+    while (innovation < -M_PI) innovation += 2.0 * M_PI;
+
+    delta_x_.fill(0.0);
+    fuseScalar(kTheta0 + 2, innovation, config_.mag_yaw_noise_rad * config_.mag_yaw_noise_rad);
+    injectErrorState();
+}
+
 InsState InsEkf::state() const {
     InsState s;
     s.timestamp_s = last_time_s_;

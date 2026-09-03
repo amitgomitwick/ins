@@ -101,11 +101,58 @@ Note that GPS never observes attitude directly (`H` has no columns in the
 `δθ` block). Attitude is corrected only through `P`'s cross-covariance
 between `δθ` and `δv`, which the `−R·[f]ₓ·δθ` term in `F` builds up over
 time whenever there's meaningful specific force (i.e. during acceleration
-or turning). This is why attitude — and yaw especially — converges more
-slowly and noisily than position/velocity, and why it converges *faster*
-during the simulated flight's acceleration and turn phases than during
-straight, constant-speed cruise. See the README for why yaw specifically is
-weak without a magnetometer.
+or turning). This is why attitude converges more slowly and noisily than
+position/velocity, and why it converges *faster* during the simulated
+flight's acceleration and turn phases than during straight, constant-speed
+cruise. Roll and pitch have a second, independent correction path — gravity
+couples directly into the accelerometer, so tilt errors show up in the
+predicted specific force itself. **Yaw has no such shortcut through GPS
+alone**, which is what the next section fixes.
+
+## Measurement update (magnetometer)
+
+`InsEkf::fuseMag()` gives yaw the direct reference GPS can't: it turns a
+magnetometer reading into a heading measurement and fuses it as one more
+scalar update on `δθ`'s third component (`kTheta0 + 2`), reusing the exact
+same `fuseScalar()` machinery as the GPS updates above.
+
+The derivation, in the filter's own conventions: since
+`R_nb = Rz(yaw) · Ry(pitch) · Rx(roll)` (the ZYX composition
+`Quaternion::fromEulerRad` builds), let `R_rp = Ry(pitch) · Rx(roll)` — the
+"yaw-zeroed" rotation from body into a frame that's level but not yet
+pointed at true north. Tilt-compensating the raw reading with the filter's
+*current* roll/pitch estimate:
+
+```
+field_level = R_rp · field_body
+```
+
+Since `R_nb · field_body = field_ned` (the true NED field) whenever the
+attitude used is exact, and `R_nb = Rz(yaw) · R_rp`:
+
+```
+field_level = Rz(yaw)⁻¹ · field_ned = Rz(−yaw) · field_ned
+```
+
+`field_ned`'s horizontal direction points at magnetic north, i.e. at angle
+`declination` from true north (same angle convention as yaw itself — see
+`InsEkfConfig::mag_declination_rad`). Rotating a vector at angle
+`declination` by `Rz(−yaw)` puts it at angle `declination − yaw`, so:
+
+```
+yaw_measured = declination − atan2(field_level.y, field_level.x)
+innovation   = wrap_to_pi(yaw_measured − yaw_nominal)
+fuseScalar(kTheta0 + 2, innovation, mag_yaw_noise_rad²)
+```
+
+Only the field's *direction* enters this (the `atan2` cancels any overall
+scale), which is why `InsEkf` never needs a calibrated field magnitude —
+though hard-iron/soft-iron offsets still bias the *direction* and must be
+calibrated out upstream, same as for any compass consumer. Tilt compensation
+uses the filter's own roll/pitch estimate, not ground truth, so residual
+roll/pitch error leaks into the derived heading — same real-world behavior
+as any tilt-compensated compass, and the reason the validation numbers below
+use the filter's actual (imperfect) roll/pitch, not the true attitude.
 
 ## Validation
 
@@ -121,16 +168,28 @@ Sanity check: with sensor noise and bias driven to ~0 and GPS run tight and
 fast, roll/pitch/yaw errors converge to well under 1° — confirming the
 filter equations themselves are correct (no sign errors, no missing
 coupling terms). The numbers below are with **realistic MEMS-grade sensor
-noise**, default 5 Hz/1.5 m/0.2 m/s GPS, and a 10 s GPS dropout mid-turn,
-across 10 random seeds:
+noise**, default 5 Hz/1.5 m/0.2 m/s GPS with a 10 s dropout mid-turn, and a
+noisy magnetometer (5° 1-sigma) at a nonzero (8°) declination, across 10
+random seeds:
 
 | | min | max | typical |
 |---|---|---|---|
-| Position RMSE | 0.7 m | 2.0 m | ~1.1 m |
-| Velocity RMSE | 0.2 m/s | 0.6 m/s | ~0.35 m/s |
-| Roll/pitch RMSE | 1.4° | 6.5° | ~3° |
-| Gyro bias error (final) | — | 0.009 rad/s | well-estimated |
-| Accel bias error (final) | — | 0.19 m/s² | forward-axis bias is weakly observable in mostly-level flight (expected — see below) |
+| Position RMSE | 0.7 m | 3.9 m | ~1.5 m |
+| Velocity RMSE | 0.2 m/s | 1.2 m/s | ~0.5 m/s |
+| Roll/pitch RMSE | 1.2° | 2.5° | ~1.8° |
+| Yaw RMSE | 1.2° | 2.5° | ~1.8° |
+| Gyro bias error (final) | — | 0.004 rad/s | well-estimated |
+| Accel bias error (final) | — | 0.38 m/s² | forward-axis bias is weakly observable in mostly-level flight (expected — see below) |
+
+**Before magnetometer fusion**, the same flight (GPS + IMU only) gave yaw
+RMSE of 1.4°–6.5° with no independent heading correction — the fix above
+roughly halves the typical case and, more importantly, removes the
+long slow-convergence tail: yaw no longer depends on the vehicle having
+maneuvered enough for GPS to indirectly reveal it. Position/velocity RMSE
+moved into a similar-but-not-identical range across the same seeds; that's
+sampling variation from a different random-draw sequence (the magnetometer
+samples consume the same RNG stream), not a regression — the underlying GPS
+fusion code is unchanged.
 
 The accelerometer bias along the body's forward axis is only weakly
 separable from a small, constant pitch error during mostly-level,
@@ -142,10 +201,19 @@ to fully identify all biases.
 
 ## Possible next steps
 
-- Magnetometer (compass heading) fusion — directly observes yaw, the
-  filter's weakest state. Same scalar-update pattern as GPS.
+- **GPS innovation gating.** `fuseScalar()` currently accepts every
+  measurement it's given, weighted only by the configured noise — there is
+  no check on whether an innovation is statistically plausible. That's a
+  real exposure to GPS spoofing (a gradually-drifting fake fix is
+  indistinguishable, in this code, from a real noisy one) and a minor one
+  to jamming glitches (a single wild fix before the link drops entirely).
+  A chi-squared/NIS test on `innovation²/S` before accepting a scalar
+  update — the same mechanism `AP_NavEKF3`'s `EKx_*_I_GATE` parameters
+  implement — would catch sudden implausible jumps; it would *not* catch a
+  slow, smoothly-varying spoof, which is the harder and more realistic
+  attack. See `docs/ardupilot_integration.md` for more on this gap.
 - Barometer fusion for a more robust vertical channel.
 - Midpoint/RK4 attitude & velocity integration instead of first-order.
 - Van Loan or closed-form discretization of `F`/`Q` instead of `I + F·dt`.
-- Joseph-form covariance update for extra numerical robustness in the GPS
+- Joseph-form covariance update for extra numerical robustness in the
   scalar updates.

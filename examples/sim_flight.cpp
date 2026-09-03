@@ -14,6 +14,7 @@ int main(int argc, char** argv) {
 
     ins_sim::ScenarioParams scenario_params;
     ins::InsEkfConfig filter_config;
+    filter_config.mag_declination_rad = scenario_params.true_mag_declination_rad;
 
     const auto result = ins_sim::runSimulation(scenario_params, filter_config, /*seed=*/42, /*keep_log=*/true);
 
@@ -39,7 +40,8 @@ int main(int argc, char** argv) {
     std::printf("Wrote %zu rows to %s\n\n", result.log.size(), out_path.c_str());
     std::printf("Position RMSE : %.3f m\n", result.pos_rmse_m);
     std::printf("Velocity RMSE : %.3f m/s\n", result.vel_rmse_m_s);
-    std::printf("Attitude RMSE : %.3f deg\n", result.att_rmse_deg);
+    std::printf("Roll/pitch RMSE : %.3f deg\n", result.att_rmse_deg);
+    std::printf("Yaw RMSE      : %.3f deg (magnetometer-aided)\n", result.yaw_rmse_deg);
     std::printf("Final gyro bias error  : [%.4f, %.4f, %.4f] rad/s\n", result.final_gyro_bias_error.x,
                 result.final_gyro_bias_error.y, result.final_gyro_bias_error.z);
     std::printf("Final accel bias error : [%.4f, %.4f, %.4f] m/s^2\n", result.final_accel_bias_error.x,
