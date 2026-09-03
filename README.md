@@ -1,11 +1,24 @@
 # INS — GPS-aided Inertial Navigation System for a UAV
 
-A standalone, dependency-free C++17 implementation of a strapdown inertial
-navigation system (INS) with GPS-aided error-state Extended Kalman Filter
-(EKF) fusion, built to be dropped into an [ArduPilot](https://ardupilot.org/)
-firmware tree as a custom estimator module. See
-[`docs/ardupilot_integration.md`](docs/ardupilot_integration.md) for exactly
-how to wire it in.
+A GPS-aided error-state Extended Kalman Filter (EKF) strapdown INS for a
+UAV, in two implementations that share the same architecture and the same
+validation approach:
+
+- **[`include/`](include/) / [`src/`](src/) (C++17)** — standalone,
+  dependency-free, meant to eventually run *inside* a flight controller
+  (see [`docs/ardupilot_integration.md`](docs/ardupilot_integration.md) for
+  wiring it into ArduPilot). This is the reference implementation the
+  equations are derived against.
+- **[`python/`](python/) (Python/numpy)** — a companion-computer port that
+  runs on a Raspberry Pi/Jetson-class Linux board and reads real telemetry
+  over MAVLink. Real flight controllers run hard-real-time C/C++, so Python
+  can't be part of that loop directly — this is what "Python on real
+  flight hardware" actually means in practice. See
+  [`docs/python_companion_computer.md`](docs/python_companion_computer.md).
+
+Everything below describes the shared architecture using the C++ paths;
+the Python port mirrors it file-for-file (`python/ins_ekf/ekf.py` ==
+`src/InsEkf.cpp`, etc.) — see `python/README.md` for its specifics.
 
 It estimates, from IMU (accelerometer + gyro) and GPS (position + velocity)
 alone:
@@ -48,13 +61,15 @@ Full derivation of the propagation/measurement equations:
 ## Layout
 
 ```
-include/ins/       Public API: Math3 (Vector3/Matrix3/Quaternion), ImuSample,
-                    GpsSample, InsEkf
-src/InsEkf.cpp      The filter implementation
+include/ins/       C++ public API: Math3 (Vector3/Matrix3/Quaternion),
+                    ImuSample, GpsSample, InsEkf
+src/InsEkf.cpp      The C++ filter implementation
 examples/           FlightScenario.h (synthetic flight generator + sim
                     runner) and sim_flight.cpp (CLI that writes a CSV log)
 tests/              Dependency-free sanity/regression tests (ctest-wired)
-docs/               Architecture derivation + ArduPilot integration guide
+python/             Companion-computer port -- see python/README.md
+docs/               Architecture derivation, ArduPilot integration guide,
+                    Python/MAVLink companion-computer guide
 ```
 
 ## Build & run
@@ -97,7 +112,14 @@ This is a validated first version: the propagation and update equations are
 implemented and covered by the sanity tests in `tests/`, the full synthetic
 flight converges with realistic sensor noise (see
 `docs/architecture.md#validation`), and the sign/derivation walkthrough for
-every equation is written down so it can be reviewed line-by-line. It has
-**not** run on real hardware or against a real ArduPilot build yet — that
-integration work is scoped out in
-[`docs/ardupilot_integration.md`](docs/ardupilot_integration.md).
+every equation is written down so it can be reviewed line-by-line. The
+Python port additionally has an end-to-end test that streams the same
+synthetic flight as *real* MAVLink UDP packets and decodes them with the
+companion tool's actual message-handling code
+(`python/tests/test_mavlink_integration.py`) — see
+`docs/python_companion_computer.md` for exactly what that does and doesn't
+prove. Neither implementation has run on real hardware or against real
+ArduPilot/SITL yet — see
+[`docs/ardupilot_integration.md`](docs/ardupilot_integration.md) (C++) and
+[`docs/python_companion_computer.md`](docs/python_companion_computer.md)
+(Python) for what's next.
