@@ -122,17 +122,18 @@ contribution guidelines.
 
 ## What this library does *not* yet give you
 
-- **No GPS innovation gating — a real spoofing/jamming exposure.**
-  `fuseScalar()` accepts every measurement it's given, weighted only by the
-  configured noise; there is no check on whether an innovation is
-  plausible. Jamming (GPS just stops) degrades gracefully — the filter
-  coasts on IMU (and now magnetometer-aided attitude), exactly like the
-  simulated dropout in `examples/FlightScenario.h`. **Spoofing does not**:
-  a fake-but-smoothly-varying GPS fix is indistinguishable, in this code,
-  from a real one, and the filter will track it. `AP_NavEKF3` mitigates
-  this with innovation/consistency gating (`EKx_POS_I_GATE`,
-  `EKx_VEL_I_GATE`) — this filter has no equivalent yet. Don't treat this
-  filter's position estimate as spoofing-resistant until that's added.
+- **Innovation gating catches a sudden bad fix, not a patient spoof.**
+  `fuseScalar()` now rejects a measurement whose innovation is implausible
+  given the filter's current covariance (`InsEkfConfig::innovation_gate_sigma`,
+  same idea as `AP_NavEKF3`'s `EKx_POS_I_GATE`/`EKx_VEL_I_GATE`), with a
+  per-channel timeout so a legitimately-drifted channel (e.g. GPS
+  reacquiring after jamming) still resyncs rather than staying locked out
+  — see `docs/architecture.md`'s "Measurement gating" section. What this
+  does **not** do: catch a fake GPS fix that drifts slowly enough to never
+  look implausible relative to the current covariance. That's a
+  structurally different, harder problem (see that doc's "Possible next
+  steps") — don't treat this filter's position estimate as fully
+  spoofing-resistant.
 - **No barometer fusion** for the vertical channel.
 - **No other sensor health/failure handling** (stuck sensors, glitch
   rejection beyond the gating gap above) — `AP_NavEKF3` has extensive logic

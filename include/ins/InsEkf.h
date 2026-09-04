@@ -61,6 +61,35 @@ struct InsEkfConfig {
     double gps_pos_noise_m = 1.5;
     double gps_vel_noise_m_s = 0.2;
 
+    // Innovation gate: a scalar update is only accepted if
+    // |innovation| <= innovation_gate_sigma * sqrt(P[i][i] + R) -- i.e. the
+    // measurement must be plausible given how uncertain the filter
+    // currently is, not just "close enough" by some fixed distance. This
+    // is the filter-level half of "GPS healthy" (the other half is the
+    // caller setting GpsSample::position_valid/velocity_valid from the
+    // receiver's own fix-quality flags -- see docs/architecture.md). 5
+    // sigma essentially never rejects genuine sensor noise (~1 in 2
+    // million) but does reject an implausible jump -- a sudden spoof
+    // attempt, a glitched fix, or a GPS reacquired after enough
+    // dead-reckoning drift that it's now the more trustworthy read.
+    //
+    // A single bad fix should be rejected; a GPS that's been *consistently*
+    // rejected for a while probably means the filter's own dead-reckoned
+    // estimate has drifted enough that the "implausible" GPS position is
+    // now more likely to be the correct one (exactly the post-jamming
+    // reacquisition case) -- so after gps_gate_reset_timeout_s of nothing
+    // being accepted, the next fix is let through unconditionally to
+    // resync, rather than the filter locking itself out forever.
+    double innovation_gate_sigma = 5.0;
+
+    // Applies to both fuseGps() and fuseMag() independently (each tracks
+    // its own "last accepted" time): if a source has been rejected for
+    // longer than this, the next reading from it is force-accepted rather
+    // than gated, so a source that's been legitimately locked out (its own
+    // estimate has drifted, not the sensor) can always resync. Without
+    // this, gating is a one-way trap -- see docs/architecture.md.
+    double gate_reset_timeout_s = 5.0;
+
     // Magnetometer heading measurement noise (1-sigma, radians) and local
     // magnetic declination (radians, positive = magnetic north is east of
     // true north) -- set this to your location's actual declination
@@ -115,8 +144,22 @@ public:
 
     // GPS position/velocity update (sequential scalar fusion). Call
     // whenever a new fix arrives; safe to call with only one of
-    // position_valid/velocity_valid set.
-    void fuseGps(const GpsSample& gps);
+    // position_valid/velocity_valid set. Every axis is checked against the
+    // innovation gate (see InsEkfConfig) before being applied -- an
+    // implausible axis is skipped, not blindly trusted. Returns true if at
+    // least one axis was actually used to correct the INS ("GPS was
+    // healthy, so it corrected the estimate"); false means every axis was
+    // rejected and the INS is navigating on IMU (and magnetometer) alone
+    // for this update, same as if fuseGps() hadn't been called at all.
+    bool fuseGps(const GpsSample& gps);
+
+    // True if any axis in the *last* fuseGps() call was forced through
+    // (gate bypassed because that specific axis had been rejected for
+    // longer than gate_reset_timeout_s) rather than passing the gate
+    // normally. Useful for logging/diagnostics -- a resync happening
+    // repeatedly is worth knowing about, distinct from a routine healthy
+    // correction.
+    bool lastGpsUpdateWasForcedResync() const { return last_gps_forced_resync_; }
 
     // Magnetometer heading update: tilt-compensates the raw reading using
     // the filter's current roll/pitch estimate, derives a heading, and
@@ -124,19 +167,33 @@ public:
     // direct observation GPS alone can't provide (see docs/architecture.md).
     // Call at the magnetometer's own sample rate (it's typically slower
     // than the IMU).
-    void fuseMag(const MagSample& mag);
+    // Returns true if the reading passed the innovation gate (or was
+    // force-accepted after gate_reset_timeout_s of rejection) and was used
+    // to correct yaw; false if it was rejected as implausible.
+    bool fuseMag(const MagSample& mag);
 
     InsState state() const;
 
     const Covariance& covariance() const { return P_; }
 
 private:
-    void fuseScalar(int state_idx, double innovation, double measurement_noise_var);
+    // Applies a scalar Kalman update unless the innovation gate rejects it.
+    // Each of the 15 state indices tracks its OWN last-accepted time (not
+    // one shared clock) -- gating and rejection are inherently per-axis in
+    // this sequential-scalar architecture (e.g. a GPS fix's north axis can
+    // be perfectly healthy while its east axis is glitching), so the
+    // force-accept timeout that un-sticks a persistently-rejected channel
+    // has to be per-axis too, or one axis's rejections can hide behind
+    // other axes' successes and never time out. Returns whether it was
+    // applied (false = rejected).
+    bool fuseScalar(int state_idx, double innovation, double measurement_noise_var, double timestamp_s);
     void injectErrorState();
 
     InsEkfConfig config_;
     bool initialized_ = false;
     double last_time_s_ = 0.0;
+    std::array<double, kNumStates> last_accepted_time_{};
+    bool last_gps_forced_resync_ = false;
 
     // Nominal state.
     Vector3 p_;

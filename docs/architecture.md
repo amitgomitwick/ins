@@ -154,6 +154,62 @@ roll/pitch error leaks into the derived heading — same real-world behavior
 as any tilt-compensated compass, and the reason the validation numbers below
 use the filter's actual (imperfect) roll/pitch, not the true attitude.
 
+## Measurement gating
+
+Every scalar update — GPS position/velocity and magnetometer heading alike
+— passes through an innovation gate in `fuseScalar()` before it's allowed
+to correct anything:
+
+```
+accept  iff  innovation² <= innovation_gate_sigma² · (P[i][i] + R)
+```
+
+i.e. the measurement has to be plausible *given how uncertain the filter
+currently is*, not just "close enough" by some fixed distance. This is the
+filter-level check that a measurement claiming to be healthy actually is —
+independent of `GpsSample::position_valid`/`velocity_valid`, which is the
+*external* check (set those from the receiver's own fix-quality report,
+e.g. `AP_GPS::status()`). Both matter: a receiver can report a fix as good
+when it isn't (spoofing), and a plausible-looking value can still disagree
+badly with where the filter knows it is.
+
+**Rejection can't be a one-way trap.** If a channel is rejected, the
+filter's own dead-reckoned estimate for it keeps drifting — so the
+*longer* a channel goes unaccepted, the *more* likely it is that the
+filter's own estimate, not the measurement, has become the wrong one
+(exactly the post-GPS-jamming reacquisition case). Each of the 15 possible
+scalar channels tracks its own independent "last accepted" time; past
+`gate_reset_timeout_s` of nothing being accepted, the next reading for
+*that channel* is forced through regardless of the gate.
+
+This has to be tracked **per channel, not per GPS fix**: an early version
+of this gate used one shared clock for the whole `fuseGps()` call, and hit
+exactly the failure mode that invites — one axis got stuck rejecting every
+fix while the *other* axes kept passing normally and kept refreshing the
+shared clock, so the stuck axis's own timeout never fired and it stayed
+~65 m off for the rest of the flight. The fix, and what's implemented now,
+is `last_accepted_time_[state_idx]` per scalar channel.
+
+**A forced accept re-inflates that channel's covariance first.** Without
+this, a channel that's been legitimately shrinking `P` for a while (normal
+behavior — repeated accepted updates make the filter more confident) would
+still only partially trust a forced correction (Kalman gain `K = P/(P+R)`
+is small when `P` is small), converge only part of the way, and then need
+*another* full `gate_reset_timeout_s` wait before the next partial step —
+recovery from a long rejection streak could take many multiples of the
+timeout instead of one. Re-inflating `P[i][i]` to at least
+`measurement_noise_var * 100` right before a forced accept makes `K`
+close to 1, so the resync actually happens in one step, same as a fresh
+GPS fix would if the filter had just been re-initialized.
+
+**The honest limit of this mechanism:** it catches a *sudden* implausible
+jump — a glitch, or a spoofing attempt that doesn't bother being subtle.
+It does not catch a *patient* spoof: a fake position that drifts slowly
+enough that every individual innovation stays within a few sigma of `P`
+never trips the gate at all, by construction — that's indistinguishable
+from genuine sensor noise using this measurement alone. See
+`docs/ardupilot_integration.md` for what a fuller defense would need.
+
 ## Validation
 
 `examples/FlightScenario.h` generates a **kinematically self-consistent**
@@ -191,6 +247,15 @@ sampling variation from a different random-draw sequence (the magnetometer
 samples consume the same RNG stream), not a regression — the underlying GPS
 fusion code is unchanged.
 
+**With innovation gating enabled** (the default), the same 10-seed sweep
+is statistically indistinguishable from the table above (e.g. position RMSE
+0.7–3.9 m either way) — confirming the gate's covariance re-inflation on
+forced-accept does what it's supposed to: normal GPS dropout recovery is
+just as fast as with no gating at all, while `tests/test_ins_ekf.cpp`'s
+`testGpsInnovationGating` separately confirms a sudden implausible fix is
+actually rejected. Gating is a real cost only against a sustained,
+gradually-diverging measurement — see the section above.
+
 The accelerometer bias along the body's forward axis is only weakly
 separable from a small, constant pitch error during mostly-level,
 non-accelerating flight (both look like the same small horizontal specific
@@ -201,17 +266,14 @@ to fully identify all biases.
 
 ## Possible next steps
 
-- **GPS innovation gating.** `fuseScalar()` currently accepts every
-  measurement it's given, weighted only by the configured noise — there is
-  no check on whether an innovation is statistically plausible. That's a
-  real exposure to GPS spoofing (a gradually-drifting fake fix is
-  indistinguishable, in this code, from a real noisy one) and a minor one
-  to jamming glitches (a single wild fix before the link drops entirely).
-  A chi-squared/NIS test on `innovation²/S` before accepting a scalar
-  update — the same mechanism `AP_NavEKF3`'s `EKx_*_I_GATE` parameters
-  implement — would catch sudden implausible jumps; it would *not* catch a
-  slow, smoothly-varying spoof, which is the harder and more realistic
-  attack. See `docs/ardupilot_integration.md` for more on this gap.
+- **Detecting a patient spoof.** Innovation gating (see above) catches a
+  sudden jump; it can't catch a fake position that drifts slowly enough to
+  never trip the gate. That needs a different kind of signal entirely —
+  e.g. cross-checking GPS against IMU-only dead reckoning over a longer
+  window, or consuming a receiver's own anti-spoofing/RAIM status (the
+  Here4's u-blox F9P exposes jamming/spoofing indicator flags over UBX,
+  separate from the DroneCAN fix message this filter consumes) — not a
+  scalar-update pattern this architecture already has.
 - Barometer fusion for a more robust vertical channel.
 - Midpoint/RK4 attitude & velocity integration instead of first-order.
 - Van Loan or closed-form discretization of `F`/`Q` instead of `I + F·dt`.

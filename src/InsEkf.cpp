@@ -75,6 +75,8 @@ void InsEkf::init(const ImuSample& first_sample, const Vector3& initial_position
     bg_ = Vector3();
     ba_ = Vector3();
     last_time_s_ = first_sample.timestamp_s;
+    last_accepted_time_.fill(first_sample.timestamp_s);
+    last_gps_forced_resync_ = false;
 
     P_ = zeroCov();
     for (int i = 0; i < 3; i++) {
@@ -151,9 +153,33 @@ void InsEkf::predict(const ImuSample& sample) {
     }
 }
 
-void InsEkf::fuseScalar(int state_idx, double innovation, double measurement_noise_var) {
+bool InsEkf::fuseScalar(int state_idx, double innovation, double measurement_noise_var, double timestamp_s) {
+    // Innovation gate: reject a measurement that's implausible given how
+    // uncertain the filter currently is (see InsEkfConfig::innovation_gate_sigma) --
+    // unless *this specific channel* has gone unaccepted long enough that its
+    // own drift, not the measurement, is now the more likely error source.
+    const bool force_accept = (timestamp_s - last_accepted_time_[state_idx]) > config_.gate_reset_timeout_s;
+
+    if (force_accept) {
+        // A channel that's been rejected for a while has likely also had
+        // its own covariance shrink (each accepted update before the
+        // rejection streak reduces P), which would otherwise make even a
+        // forced correction here weak (small Kalman gain -> a timid,
+        // partial blend instead of an actual resync, and repeat for
+        // several more reset-timeout cycles). Treat it as freshly
+        // uncertain instead, so this correction snaps to the new
+        // measurement in one step -- the same logic as re-initializing
+        // that channel's covariance.
+        P_[state_idx][state_idx] = std::max(P_[state_idx][state_idx], measurement_noise_var * 100.0);
+    }
+
     const double S = P_[state_idx][state_idx] + measurement_noise_var;
-    if (S < 1e-15) return;
+    if (S < 1e-15) return false;
+
+    if (!force_accept) {
+        const double gate = config_.innovation_gate_sigma;
+        if (innovation * innovation > gate * gate * S) return false;
+    }
 
     std::array<double, kNumStates> K{};
     for (int i = 0; i < kNumStates; i++) K[i] = P_[i][state_idx] / S;
@@ -163,6 +189,9 @@ void InsEkf::fuseScalar(int state_idx, double innovation, double measurement_noi
     const std::array<double, kNumStates> Hrow = P_[state_idx];  // H is a unit row vector
     for (int i = 0; i < kNumStates; i++)
         for (int j = 0; j < kNumStates; j++) P_[i][j] -= K[i] * Hrow[j];
+
+    last_accepted_time_[state_idx] = timestamp_s;
+    return true;
 }
 
 void InsEkf::injectErrorState() {
@@ -179,28 +208,37 @@ void InsEkf::injectErrorState() {
     delta_x_.fill(0.0);
 }
 
-void InsEkf::fuseGps(const GpsSample& gps) {
-    if (!initialized_) return;
+bool InsEkf::fuseGps(const GpsSample& gps) {
+    if (!initialized_) return false;
     delta_x_.fill(0.0);
 
+    last_gps_forced_resync_ = false;
+    bool any_accepted = false;
     if (gps.position_valid) {
         for (int axis = 0; axis < 3; axis++) {
+            const int idx = kP0 + axis;
+            if (gps.timestamp_s - last_accepted_time_[idx] > config_.gate_reset_timeout_s) last_gps_forced_resync_ = true;
             const double innovation = gps.position_ned_m[axis] - p_[axis];
-            fuseScalar(kP0 + axis, innovation, config_.gps_pos_noise_m * config_.gps_pos_noise_m);
+            if (fuseScalar(idx, innovation, config_.gps_pos_noise_m * config_.gps_pos_noise_m, gps.timestamp_s))
+                any_accepted = true;
         }
     }
     if (gps.velocity_valid) {
         for (int axis = 0; axis < 3; axis++) {
+            const int idx = kV0 + axis;
+            if (gps.timestamp_s - last_accepted_time_[idx] > config_.gate_reset_timeout_s) last_gps_forced_resync_ = true;
             const double innovation = gps.velocity_ned_m_s[axis] - v_[axis];
-            fuseScalar(kV0 + axis, innovation, config_.gps_vel_noise_m_s * config_.gps_vel_noise_m_s);
+            if (fuseScalar(idx, innovation, config_.gps_vel_noise_m_s * config_.gps_vel_noise_m_s, gps.timestamp_s))
+                any_accepted = true;
         }
     }
 
     injectErrorState();
+    return any_accepted;
 }
 
-void InsEkf::fuseMag(const MagSample& mag) {
-    if (!initialized_) return;
+bool InsEkf::fuseMag(const MagSample& mag) {
+    if (!initialized_) return false;
 
     // Tilt-compensate: express the reading in the "yaw=0" intermediate
     // frame (body rotated by the filter's current roll/pitch only). Since
@@ -219,8 +257,10 @@ void InsEkf::fuseMag(const MagSample& mag) {
     while (innovation < -M_PI) innovation += 2.0 * M_PI;
 
     delta_x_.fill(0.0);
-    fuseScalar(kTheta0 + 2, innovation, config_.mag_yaw_noise_rad * config_.mag_yaw_noise_rad);
+    const bool accepted = fuseScalar(kTheta0 + 2, innovation, config_.mag_yaw_noise_rad * config_.mag_yaw_noise_rad,
+                                      mag.timestamp_s);
     injectErrorState();
+    return accepted;
 }
 
 InsState InsEkf::state() const {

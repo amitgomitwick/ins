@@ -103,6 +103,20 @@ Only the magnetometer's *direction* is used (not calibrated magnitude), but
 hard-iron/soft-iron offsets still need to be calibrated out upstream, same
 as any other compass consumer.
 
+## GPS as a helper, not a source of truth
+
+Every GPS (and magnetometer) update passes an innovation gate before it's
+allowed to correct anything: the filter checks whether the measurement is
+*plausible* given its current uncertainty, not just "close enough" by some
+fixed distance, and rejects it if not (`InsEkfConfig::innovation_gate_sigma`).
+A channel that's been rejected for too long (`gate_reset_timeout_s`) is
+forced through anyway, so a channel that's *actually* drifted — like GPS
+reacquiring after a real jamming outage — still resyncs rather than
+staying permanently distrusted. Full derivation, and the honest limit of
+this (it catches a sudden bad fix, not a patient spoof that drifts slowly
+enough to never look implausible), in `docs/architecture.md`'s
+"Measurement gating" section.
+
 ## Status
 
 This is a validated implementation: the propagation and update equations
