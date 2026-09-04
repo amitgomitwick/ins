@@ -1,2 +1,4 @@
 build/
 *.csv
+__pycache__/
+*.pyc

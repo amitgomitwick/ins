@@ -18,6 +18,9 @@ target_include_directories(ins_ekf PUBLIC include)
 add_executable(sim_flight examples/sim_flight.cpp)
 target_link_libraries(sim_flight PRIVATE ins_ekf)
 
+add_executable(replay_log examples/replay_log.cpp)
+target_link_libraries(replay_log PRIVATE ins_ekf)
+
 enable_testing()
 add_executable(test_ins_ekf tests/test_ins_ekf.cpp)
 target_link_libraries(test_ins_ekf PRIVATE ins_ekf)

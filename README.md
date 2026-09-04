@@ -52,7 +52,11 @@ include/ins/       Public API: Math3 (Vector3/Matrix3/Quaternion), ImuSample,
                     GpsSample, MagSample, InsEkf
 src/InsEkf.cpp      The filter implementation
 examples/           FlightScenario.h (synthetic flight generator + sim
-                    runner) and sim_flight.cpp (CLI that writes a CSV log)
+                    runner), sim_flight.cpp (CLI that writes a CSV log),
+                    replay_log.cpp (runs REAL logged sensor data through
+                    InsEkf -- see tools/README.md)
+tools/              parse_dataflash_log.py -- one-time ArduPilot .bin log
+                    -> CSV conversion for replay_log.cpp (see tools/README.md)
 tests/              Dependency-free sanity/regression tests (ctest-wired)
 docs/               Architecture derivation + ArduPilot integration guide
 ```
@@ -78,6 +82,28 @@ Velocity RMSE   : ~0.3–0.6 m/s
 Roll/pitch RMSE : ~1.3–2.5 deg
 Yaw RMSE        : ~1.2–2.5 deg (magnetometer-aided)
 ```
+
+## Replaying real flight-controller data
+
+`sim_flight` proves the filter against synthetic data. `replay_log` runs
+it against **real logged IMU/GPS/magnetometer data** pulled from an
+ArduPilot dataflash log — e.g. a bench test, a car-roof test drive, or an
+actual flight:
+
+```sh
+pip install pymavlink
+python3 tools/parse_dataflash_log.py your_flight.bin --out-dir replay_data/
+./build/replay_log --imu replay_data/imu.csv --gps replay_data/gps.csv \
+    --mag replay_data/mag.csv --ekf3 replay_data/ekf3.csv \
+    --declination-deg <from the script's output> --out replay_output.csv
+```
+
+It reports how many GPS/magnetometer readings the innovation gate
+accepted vs. rejected, and — if the log had EKF3's own output too — a
+rough comparison against it. See `tools/README.md` for exactly what's
+verified here vs. not (short version: field names/units are checked
+against ArduPilot's actual source, but this hasn't been run against a
+real log yet in this session — you'd be the first).
 
 ## Yaw, and the magnetometer fix
 
